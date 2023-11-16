@@ -23,7 +23,6 @@ import Telegram.Bot.API
 import Telegram.Bot.Simple
 import Telegram.Bot.Simple.UpdateParser hiding (text)
 import Text.Read
-import System.Posix.Types (UserID)
 
 -- | Make User hashable
 
@@ -235,20 +234,29 @@ addShares userIds model = case sharedAmount model of
   Nothing -> model
   Just (number, usr) ->
     model
-      { debtorsMap = HashMap.insert usr (increaseShares usersToShare averageDebt innerHashMap) (debtorsMap model)
+      { debtorsMap = HashMap.insert usr (increaseShares usr usersToShare averageDebt innerMap) decreasedMap
       , sharedAmount = Nothing
       }
     where
-      innerHashMap = HashMap.lookup usr (debtorsMap model)
+      decreasedMap = decreaseShares usersToShare (debtorsMap model)
+      innerMap = HashMap.lookup usr decreasedMap
       averageDebt = number `div` length userIds
       usersToShare = mapMaybe (userIdToUserMapper model) userIds
 
       -- Увеличение долгов у пользователей от известного пользователя (внутренний hashmap)
-      increaseShares :: [User] -> Int -> Maybe (HashMap User Int) -> HashMap User Int
-      increaseShares [] _ debtors = Data.Maybe.fromMaybe HashMap.empty debtors
-      increaseShares (_user : _users) _number debtors
-        | _user == usr = increaseShares _users _number debtors
-        | otherwise = HashMap.insertWith (+) _user _number (increaseShares _users _number debtors)
+      increaseShares :: User -> [User] -> Int -> Maybe (HashMap User Int) -> HashMap User Int
+      increaseShares _ [] _ debtors = fromMaybe HashMap.empty debtors
+      increaseShares currUser (_user : _users) amount debtors 
+        | _user == currUser = increaseShares currUser _users amount debtors
+        | otherwise = HashMap.insertWith (+) _user amount (increaseShares currUser _users amount debtors)
+
+      decreaseShares :: [User] -> HashMap User (HashMap User Int) -> HashMap User (HashMap User Int)
+      decreaseShares [] x = x
+      decreaseShares (_user : _users) debtors =
+        decreaseShares _users (HashMap.insert _user (increaseShares _user [usr] (-averageDebt) (Just innerDebtors)) debtors)
+        where 
+          innerDebtors = HashMap.lookupDefault HashMap.empty _user debtors
+
 
 registerUser :: User -> Model -> Model
 registerUser user model
@@ -265,24 +273,30 @@ showDebts model = model
 createDebtsMessage :: User -> Model -> Text
 createDebtsMessage user model
   | HashMap.member uid (users model) = listOfDebtsToText user model
-  | otherwise = "You are not login, please, write /start"
+  | otherwise = "You are not registered =(\n Write /start"
   where
     uid = userIdToInteger (userId user)
 
-getInfoInside :: User -> Model -> Text
-getInfoInside _ _ = ""
-
 listOfDebtsToText :: User -> Model -> Text
-listOfDebtsToText user model 
-  | HashMap.member uid (users model) = case HashMap.lookup user (debtorsMap model) of
-      Nothing -> "You have no debts!"
-      Just debtors -> Text.intercalate " | "
-          [ userName debtor <> " : " <> Text.pack (show amount)
-          | (debtor, amount) <- HashMap.toList debtors
-          ]
-  | otherwise = "You are not registered =(\n Write /start"
-  where 
-    uid = userIdToInteger (userId user)
+listOfDebtsToText user model = case HashMap.lookup user (debtorsMap model) of
+  Nothing -> "Something went wrong. Probably you are not registered.\n Write /start"
+  Just debtors -> if debtorsText == ""
+                  then "You have no debts"
+                  else debtorsText
+    where 
+      debtorsText = Text.intercalate "\n"
+        [ userName debtor <> " : " <> Text.pack (show amount)
+        | (debtor, amount) <- HashMap.toList debtors
+        ] 
+
+-- TODO:
+-- Регистрация 2 раза (Вагиф)
+-- Не давать делать /show_debt без регистрации
+-- Удалять из мапы должников если 0 долг
+-- Разделиь я должен ..., мне должны ... -- Можно понимать по занку долга
+-- В addShares вычитать у того на кого делим <<< done
+--
+-- Не отвечать в лс
 
 run :: Token -> IO ()
 run token = do
