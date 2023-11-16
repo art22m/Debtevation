@@ -2,33 +2,50 @@
 {-# OPTIONS_GHC -Wno-unrecognised-pragmas #-}
 
 {-# HLINT ignore "Use newtype instead of data" #-}
+{-# LANGUAGE InstanceSigs #-}
+{-# OPTIONS_GHC -Wno-orphans #-}
+
 module Main where
 
-import Data.Hashable (Hashable)
-import Data.HashMap.Strict (HashMap)
+import Data.Hashable
+
 import Data.HashSet (HashSet)
 import qualified Data.HashSet as HashSet
+
+import Data.HashMap.Strict (HashMap)
 import qualified Data.HashMap.Strict as HashMap
-import Data.Maybe (isJust, fromMaybe)
+
+import Data.Maybe (isJust, fromMaybe, mapMaybe)
 import Data.Text (Text, breakOn, pack, stripStart, unpack)
 import qualified Data.Text as Text
+
 import Telegram.Bot.API
 import Telegram.Bot.Simple
 import Telegram.Bot.Simple.UpdateParser hiding (text)
 import Text.Read
+import System.Posix.Types (UserID)
 
--- instance Eq User
--- instance Hashable User
+-- | Make User hashable
+
+instance Eq User where
+  (==) :: User -> User -> Bool
+  x == y = userId x == userId y
+
+instance Hashable User where
+  hashWithSalt :: Int -> User -> Int
+  hashWithSalt salt user = salt + fromIntegral uid
+    where
+      uid = userIdToInteger (userId user)
 
 type Item = Text
 
 data Model = Model
-  { debtorsMap    :: HashMap Integer (HashMap Integer Int),
-    users         :: HashMap Integer User,
-    shareDebtors  :: HashSet Integer, -- UserIds
+  { debtorsMap    :: HashMap User (HashMap User Int),
 
-    sharedAmount  :: Maybe(Int, Integer),
-    paidAmount    :: Maybe(Int, Integer)
+    users         :: HashMap Integer User,
+
+    shareDebtors  :: HashSet Integer, -- UserIds
+    sharedAmount  :: Maybe(Int, User)
   }
 
 data Status = UID Integer | Done | Cancel
@@ -40,8 +57,7 @@ initialModel =
     { debtorsMap = HashMap.empty,
       users = HashMap.empty,
       shareDebtors = HashSet.empty,
-      sharedAmount = Nothing,
-      paidAmount = Nothing
+      sharedAmount = Nothing
     }
 
 type Amount = Int
@@ -49,7 +65,6 @@ type Amount = Int
 data Action
   = Start User
   | Share User Amount
-  | Pay User Amount
   | Show Text
   | ShowDebt User
   | FinishShare
@@ -93,13 +108,13 @@ debtBot =
 
           case (user_, amount_) of
             (Just user, Just amount) -> Just (Share user amount)
-            (_, _) -> Nothing
+            (_, _) -> Just (Show "Enter a non-zero number separated by a space, like this:\n/share 100")
 
       | isJust $ parseUpdate (command "show_debt") update = do
           let msg = updateMessage update
-          case msg of 
+          case msg of
             Nothing -> Just (Show "SHOW_DEBT_MSG_NOTHING_FAIL")
-            Just _msg -> 
+            Just _msg ->
               case messageFrom _msg of
                   Just user -> Just (ShowDebt user)
                   _ -> Just (Show "SHOW_DEBT_NOTHING_FAIL_2")
@@ -107,7 +122,7 @@ debtBot =
       | otherwise = do
         let msg = updateCallbackQuery update
         case msg of
-          Nothing -> Just (Show "No callback message")
+          Nothing -> Just (Show "No such command =( \nWrite /help to see existing commands.")
           Just _msg -> case callbackQueryData _msg of
               Nothing -> Just (Show "No data in callback message")
               Just msgText -> case matchMessage msgText of
@@ -120,17 +135,13 @@ debtBot =
       Start usr -> registerUser usr model <# do
           replyText startMessage
 
-      Share usr amount -> shareAmount (amount, userIdToInteger (userId usr)) model <# do
+      Share usr amount -> shareAmount (amount, usr) model <# do
           reply
             (toReplyMessage "Select users to share debt with:")
               { replyMessageReplyMarkup = Just (SomeInlineKeyboardMarkup (shareKeyboard model)) }
 
-      Pay usr amount ->
-        payAmount (amount, userIdToInteger (userId usr)) model <# do
-          replyText "Successfully payed!"
-
       Show text ->
-        showDebts model <# do
+        showDebts model <# do -- showDebts в Show text - норм?
           replyText text
 
       ShowDebt user ->
@@ -182,19 +193,15 @@ debtBot =
 
         userToButtonName :: User -> Text
         userToButtonName user
-            | selected  = pack ("+ " ++ name)
-            | otherwise = pack name
+            | selected  = "✅ " <> userName user
+            | otherwise = "❌ " <> userName user
             where
-                firstName = userFirstName user
-                lastName = fromMaybe " " (userLastName user)
-                name = unpack firstName ++ " " ++ unpack lastName
-
                 uid = userIdToInteger (userId user)
                 selected = HashSet.member uid (shareDebtors model)
 
     startMessage =
       Text.unlines
-        [ "You successfully registered!"]
+        [ "You successfully registered =)"]
 
 
 removeCommand :: Maybe Text -> Maybe Text
@@ -204,81 +211,56 @@ removeCommand Nothing = Nothing
 userIdToInteger :: UserId -> Integer
 userIdToInteger (UserId i) = i
 
+userName :: User -> Text
+userName user = firstName <> " " <> lastName
+  where
+    firstName = userFirstName user
+    lastName = fromMaybe " " (userLastName user)
 
 textToInt :: Maybe Text -> Maybe Int
 textToInt (Just text_) = readMaybe (unpack text_)
 textToInt Nothing = Nothing
 
-shareAmount :: (Amount, Integer) -> Model -> Model
-shareAmount _amount model =
+shareAmount :: (Amount, User) -> Model -> Model
+shareAmount x model =
   model
-    { sharedAmount = Just _amount }
+    { sharedAmount = Just x }
 
-payAmount :: (Amount, Integer) -> Model -> Model
-payAmount _amount model =
-  model
-    { paidAmount = Just _amount
-    }
+userIdToUserMapper :: Model -> UserId -> Maybe User
+userIdToUserMapper model (UserId userID) = HashMap.lookup userID (users model)
 
 -- -- Увеличение долгов, выданных конкретным пользователем, конкретным пользователям
 addShares :: [UserId] -> Model -> Model
 addShares userIds model = case sharedAmount model of
   Nothing -> model
-  Just (number, integerInitId) ->
+  Just (number, usr) ->
     model
-      { debtorsMap = HashMap.insert integerInitId (increaseShares userIds (number `div` length userIds) innerHashMap) _hashMap
+      { debtorsMap = HashMap.insert usr (increaseShares usersToShare averageDebt innerHashMap) (debtorsMap model)
       , sharedAmount = Nothing
       }
     where
-      _hashMap = debtorsMap model
-      innerHashMap = HashMap.lookup integerInitId _hashMap
+      innerHashMap = HashMap.lookup usr (debtorsMap model)
+      averageDebt = number `div` length userIds
+      usersToShare = mapMaybe (userIdToUserMapper model) userIds
 
       -- Увеличение долгов у пользователей от известного пользователя (внутренний hashmap)
-      increaseShares :: [UserId] -> Int -> Maybe (HashMap Integer Int) -> HashMap Integer Int
-      increaseShares [] _ hashmap = Data.Maybe.fromMaybe HashMap.empty hashmap
-      increaseShares (_userId : _userIds) _number hashmap =
-        HashMap.insertWith (+) integerUserId _number (increaseShares (_userId : _userIds) _number hashmap)
-          where
-            integerUserId = userIdToInteger _userId
-
--- -- Увеличение долгов, выданных конкретным пользователем, конкретным пользователям
-subtrShares :: UserId -> Model -> Model
-subtrShares debtor model = case sharedAmount model of
-  Nothing -> model
-  Just (number, integerCredorId) ->
-    model
-      { debtorsMap = HashMap.insert integerCredorId subtrInnerMap _hashMap
-      , paidAmount = Nothing
-      }
-    where
-      _hashMap = debtorsMap model
-      innerMap = HashMap.lookup integerCredorId _hashMap
-      subtrInnerMap = decreaseShares debtor number innerMap
-
-      -- Увеличение долгов у пользователей от известного пользователя (внутренний hashmap)
-      decreaseShares :: UserId -> Int -> Maybe (HashMap Integer Int) -> HashMap Integer Int
-      decreaseShares _userId _number _hashMap = case _hashMap of
-          Nothing -> HashMap.fromList [(integerUserId, _number)]
-            where
-              integerUserId = userIdToInteger _userId
-          Just hMap ->
-            HashMap.insertWith subtructionFunc integerUserId _number hMap
-            where
-              subtructionFunc old new = if old > new then old-new else 0
-              integerUserId = userIdToInteger _userId
+      increaseShares :: [User] -> Int -> Maybe (HashMap User Int) -> HashMap User Int
+      increaseShares [] _ debtors = Data.Maybe.fromMaybe HashMap.empty debtors
+      increaseShares (_user : _users) _number debtors
+        | _user == usr = increaseShares _users _number debtors
+        | otherwise = HashMap.insertWith (+) _user _number (increaseShares _users _number debtors)
 
 registerUser :: User -> Model -> Model
 registerUser user model
     | HashMap.member uid (users model) = model
     | otherwise = model
-        { debtorsMap = HashMap.insert uid HashMap.empty (debtorsMap model)
+        { debtorsMap = HashMap.insert user HashMap.empty (debtorsMap model)
         , users = HashMap.insert uid user (users model) }
    where
     uid = userIdToInteger (userId user)
 
 showDebts :: Model -> Model
 showDebts model = model
-
 
 createDebtsMessage :: User -> Model -> Text
 createDebtsMessage user model
@@ -291,19 +273,16 @@ getInfoInside :: User -> Model -> Text
 getInfoInside _ _ = ""
 
 listOfDebtsToText :: User -> Model -> Text
-listOfDebtsToText user model = 
-  maybe "You are not register 1" go $
-    HashMap.lookup uid (debtorsMap model)
-    where
-        uid = userIdToInteger (userId user)
-
-        go :: HashMap Integer Int -> Text
-        go debtors = Text.intercalate " | "
-          [ name <> " : " <> Text.pack (show amount)
-          | (debtorId, amount) <- HashMap.toList debtors
-          , let mname = HashMap.lookup debtorId (users model)
-          , let name = maybe (Text.pack (show debtorId)) userFirstName mname
+listOfDebtsToText user model 
+  | HashMap.member uid (users model) = case HashMap.lookup user (debtorsMap model) of
+      Nothing -> "You have no debts!"
+      Just debtors -> Text.intercalate " | "
+          [ userName debtor <> " : " <> Text.pack (show amount)
+          | (debtor, amount) <- HashMap.toList debtors
           ]
+  | otherwise = "You are not registered =(\n Write /start"
+  where 
+    uid = userIdToInteger (userId user)
 
 run :: Token -> IO ()
 run token = do
