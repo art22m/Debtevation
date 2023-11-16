@@ -73,6 +73,7 @@ executable debtevation
                     , telegram-bot-api
                     , text
                     , unordered-containers
+                    , hashable
 
     -- Directories containing source files.
     hs-source-dirs:   app

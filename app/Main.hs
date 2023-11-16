@@ -4,7 +4,7 @@
 {-# HLINT ignore "Use newtype instead of data" #-}
 module Main where
 
-import Control.Applicative
+import Data.Hashable (Hashable)
 import Data.HashMap.Strict (HashMap)
 import Data.HashSet (HashSet)
 import qualified Data.HashSet as HashSet
@@ -16,6 +16,9 @@ import Telegram.Bot.API
 import Telegram.Bot.Simple
 import Telegram.Bot.Simple.UpdateParser hiding (text)
 import Text.Read
+
+-- instance Eq User
+-- instance Hashable User
 
 type Item = Text
 
@@ -29,7 +32,6 @@ data Model = Model
   }
 
 data Status = UID Integer | Done | Cancel
-
 
 
 initialModel :: Model
@@ -288,56 +290,20 @@ createDebtsMessage user model
 getInfoInside :: User -> Model -> Text
 getInfoInside _ _ = ""
 
-listOfDebtsToTextNotWork :: User -> Model -> Text
-listOfDebtsToTextNotWork user model =
-  case HashMap.lookup uid (debtorsMap model) of
-    Nothing -> "Вам никто не должен"
-    Just innerMap -> foldr toDebtMessage "Вам должны:" (toTextList debtsList) -- [(Integer, Int)] -> Integer
-      where
-        debtsList = HashMap.toList innerMap
-        idToUser = users model
-
-        toDebtMessage :: (Text, Int) -> Text -> Text -- userFirstName
-        toDebtMessage (name, amount) prev = Text.append prev (Text.append (Text.append name ": ") (pack $ show amount))
-
-        toTextList :: [(Integer, Int)] -> [(Text, Int)]
-        toTextList [] = []
-        toTextList ((userID, amnt):[]) = [(username, amnt)]
-          where
-            username = case HashMap.lookup userID idToUser of
-              Just usr -> userFirstName usr
-              Nothing -> "Not found"
-        toTextList ((userID, amnt):others) = (username, amnt):toTextList others
-          where
-            username = case HashMap.lookup userID idToUser of
-              Just usr -> userFirstName usr
-              Nothing -> "Not found"
-  where
-    uid = userIdToInteger (userId user)
-
 listOfDebtsToText :: User -> Model -> Text
 listOfDebtsToText user model = 
-  maybe "You are not register 1" go (HashMap.lookup uid debtors)
+  maybe "You are not register 1" go $
+    HashMap.lookup uid (debtorsMap model)
     where
-        debtors = debtorsMap model
         uid = userIdToInteger (userId user)
 
         go :: HashMap Integer Int -> Text
-        go mp = pack ("Your debtors:\n" ++ unpack (Text.intercalate " | " infoWithNames))
-          where 
-            info :: [(Integer, Int)] 
-            info = zip [1, 2] [2, 1]
-            -- info = HashMap.toList mp
-
-            infoWithNames :: [Text]
-            infoWithNames  = map go' info
-
-            go' :: (Integer, Int) -> Text
-            go' (uid', amount) = pack (unpack name' ++ " : " ++ show amount)
-                where 
-                    name' = case HashMap.lookup uid' (users model) of
-                        Just usr -> userFirstName usr
-                        Nothing -> "Not found"
+        go debtors = Text.intercalate " | "
+          [ name <> " : " <> Text.pack (show amount)
+          | (debtorId, amount) <- HashMap.toList debtors
+          , let mname = HashMap.lookup debtorId (users model)
+          , let name = maybe (Text.pack (show debtorId)) userFirstName mname
+          ]
 
 run :: Token -> IO ()
 run token = do
@@ -346,6 +312,6 @@ run token = do
 
 main :: IO ()
 main = do
-  -- putStrLn "Please, enter Telegram bot's API token:"
+  putStrLn "Started..."
   -- token <- Token . Text.pack <$> getLine
   run ""
