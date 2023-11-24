@@ -62,10 +62,12 @@ initialModel =
 type Amount = Int
 
 data Action
-  = Start User
+  = Help
+  | NotAvailableCommand
+  | Start User
   | Share User Amount
-  | Show Text
-  | ShowDebt User
+  | ShowCallback Text
+  | Show User
   | FinishShare
   | CancelShare
   | ChangeDebtor Integer
@@ -92,58 +94,80 @@ debtBot =
     }
   where
     updateToAction :: Update -> Model -> Maybe Action
-    updateToAction update _
-      | isJust $ parseUpdate (command "start") update = do
+    updateToAction update model
+      | isCommand update "start" = do
           msg <- updateMessage update
           let user_ = messageFrom msg
           case user_ of
             Just user -> Just (Start user)
             _ -> Nothing
 
-      | isJust $ parseUpdate (command "share") update = do
-          msg <- updateMessage update
-          let user_ = messageFrom msg
-          let amount_ = textToInt $ removeCommand $ messageText msg
+      | isCommand update "share" = do
+          if not (isRegistered update model) then Just NotAvailableCommand
+          else do
+            msg <- updateMessage update
+            let user_ = messageFrom msg
+            let amount_ = textToInt $ removeCommand $ messageText msg
 
-          case (user_, amount_) of
-            (Just user, Just amount) -> Just (Share user amount)
-            (_, _) -> Just (Show "Enter a non-zero number separated by a space, like this:\n/share 100")
+            case (user_, amount_) of
+              (Just user, Just amount) -> Just (Share user amount)
+              (_, _) -> Just (ShowCallback "Enter a non-zero number separated by a space, like this:\n/share 100")
 
-      | isJust $ parseUpdate (command "show_debt") update = do
-          let msg = updateMessage update
-          case msg of
-            Nothing -> Just (Show "SHOW_DEBT_MSG_NOTHING_FAIL")
-            Just _msg ->
-              case messageFrom _msg of
-                  Just user -> Just (ShowDebt user)
-                  _ -> Just (Show "SHOW_DEBT_NOTHING_FAIL_2")
+      | isCommand update "show" = do
+          if not (isRegistered update model) then Just NotAvailableCommand
+          else do
+            let msg = updateMessage update
+            case msg of
+              Nothing -> Just (ShowCallback "SHOW_DEBT_MSG_NOTHING_FAIL")
+              Just _msg ->
+                case messageFrom _msg of
+                    Just user -> Just (Show user)
+                    _ -> Just (ShowCallback "SHOW_DEBT_NOTHING_FAIL_2")
+
+      | isCommand update "help" = Just Help
 
       | otherwise = do
         let msg = updateCallbackQuery update
         case msg of
-          Nothing -> Just (Show "No such command =( \nWrite /help to see existing commands.")
+          Nothing -> Just (ShowCallback "No such command =(\nWrite /help to see existing commands.")
           Just _msg -> case callbackQueryData _msg of
-              Nothing -> Just (Show "No data in callback message")
-              Just msgText -> case matchMessage msgText of
-                 Done -> Just FinishShare -- Call addShares
-                 Cancel -> Just CancelShare -- Clear sharedAmount
-                 UID _userId -> Just (ChangeDebtor _userId) -- Add new user to Set
+              Nothing -> Just (ShowCallback "No data in callback message")
+              Just msgText -> case sharedAmount model of
+                Just shareUser -> if userName (callbackQueryFrom _msg) == userName (snd shareUser)
+                                    then case matchMessage msgText of
+                                      Done -> Just FinishShare -- Call addShares
+                                      Cancel -> Just CancelShare -- Clear sharedAmount
+                                      UID _userId -> Just (ChangeDebtor _userId) -- Add new user to Set
+                                    else Nothing
+                Nothing -> Just (ShowCallback "No data in callback message")
 
     handleAction :: Action -> Model -> Eff Action Model
     handleAction action model = case action of
+      Help -> model <# do
+                  replyText $ pack ( "/help - No comments" ++ "\n"
+                                  ++ "/start - Registration command" ++ "\n"
+                                  ++ "/share <<num>> - Share money between registered users. Ex. /share 100" ++ "\n"
+                                  ++ "/show - Display all your debtors and everyone you owe money to" ++ "\n")
+
       Start usr -> registerUser usr model <# do
-          replyText startMessage
+        if HashMap.member (userIdToInteger (userId usr)) (users model) then
+            replyText alreadyRegisteredMessage
+        else replyText startMessage
 
       Share usr amount -> shareAmount (amount, usr) model <# do
           reply
             (toReplyMessage "Select users to share debt with:")
               { replyMessageReplyMarkup = Just (SomeInlineKeyboardMarkup (shareKeyboard model)) }
 
-      Show text ->
+      NotAvailableCommand ->
+        showDebts model <# do -- showDebts в Show text - норм?
+          replyText needToRegisterMessage
+
+      ShowCallback text ->
         showDebts model <# do -- showDebts в Show text - норм?
           replyText text
 
-      ShowDebt user ->
+      Show user ->
         showDebts model <# do
           replyText $ createDebtsMessage user model
 
@@ -182,8 +206,8 @@ debtBot =
         _users = HashMap.elems (users model)
 
         namesButtons = map (\user -> callbackButton (userToButtonName user) (userToTextUserId user)) _users
-        doneButton = callbackButton "done" "2"
-        cancelButton = callbackButton "cancel" "3"
+        doneButton = callbackButton "☑️ done" "2"
+        cancelButton = callbackButton "✖️ cancel" "3"
 
         userToTextUserId :: User -> Text
         userToTextUserId user = pack ("1" ++ show uid)
@@ -201,6 +225,12 @@ debtBot =
     startMessage =
       Text.unlines
         [ "You successfully registered =)"]
+    alreadyRegisteredMessage =
+      Text.unlines
+        [ "You are already registered"]
+    needToRegisterMessage =
+      Text.unlines
+        [ "Before using this command, please, register using /start"]
 
 
 removeCommand :: Maybe Text -> Maybe Text
@@ -228,25 +258,42 @@ shareAmount x model =
 userIdToUserMapper :: Model -> UserId -> Maybe User
 userIdToUserMapper model (UserId userID) = HashMap.lookup userID (users model)
 
--- -- Увеличение долгов, выданных конкретным пользователем, конкретным пользователям
+isCommand :: Update -> Text -> Bool
+isCommand update cmd = isJust (parseUpdate (command cmd) update) || isJust (parseUpdate (command (cmd <> pack "@debtevation_bot")) update)
+
+isRegistered :: Update -> Model -> Bool
+isRegistered update model =
+  case updateMessage update of
+    Just msg ->
+      case messageFrom msg of
+        Just user -> HashMap.member uid (users model)
+          where
+            uid = userIdToInteger (userId user)
+        _ -> False
+    _ -> False
+
+-- Увеличение долгов, выданных конкретным пользователем, конкретным пользователям
 addShares :: [UserId] -> Model -> Model
 addShares userIds model = case sharedAmount model of
   Nothing -> model
   Just (number, usr) ->
     model
-      { debtorsMap = HashMap.insert usr (increaseShares usr usersToShare averageDebt innerMap) decreasedMap
+      { debtorsMap = filteredResult
       , sharedAmount = Nothing
       }
     where
       decreasedMap = decreaseShares usersToShare (debtorsMap model)
       innerMap = HashMap.lookup usr decreasedMap
-      averageDebt = number `div` length userIds
+      averageDebt = (number + length userIds - 1) `div` length userIds
       usersToShare = mapMaybe (userIdToUserMapper model) userIds
+
+      nonFilteredResult = HashMap.insert usr (increaseShares usr usersToShare averageDebt innerMap) decreasedMap
+      filteredResult = removeZeros (HashMap.keys nonFilteredResult) nonFilteredResult
 
       -- Увеличение долгов у пользователей от известного пользователя (внутренний hashmap)
       increaseShares :: User -> [User] -> Int -> Maybe (HashMap User Int) -> HashMap User Int
       increaseShares _ [] _ debtors = fromMaybe HashMap.empty debtors
-      increaseShares currUser (_user : _users) amount debtors 
+      increaseShares currUser (_user : _users) amount debtors
         | _user == currUser = increaseShares currUser _users amount debtors
         | otherwise = HashMap.insertWith (+) _user amount (increaseShares currUser _users amount debtors)
 
@@ -254,9 +301,16 @@ addShares userIds model = case sharedAmount model of
       decreaseShares [] x = x
       decreaseShares (_user : _users) debtors =
         decreaseShares _users (HashMap.insert _user (increaseShares _user [usr] (-averageDebt) (Just innerDebtors)) debtors)
-        where 
+        where
           innerDebtors = HashMap.lookupDefault HashMap.empty _user debtors
 
+      removeZeros :: [User] -> HashMap User (HashMap User Int) -> HashMap User (HashMap User Int)
+      removeZeros [] x = x
+      removeZeros (_user : _users) debtors =
+        removeZeros _users (HashMap.insert _user filteredInnerDebtors debtors)
+        where
+          innerDebtors = HashMap.lookupDefault HashMap.empty _user debtors
+          filteredInnerDebtors = HashMap.filter (/= 0) innerDebtors
 
 registerUser :: User -> Model -> Model
 registerUser user model
@@ -280,23 +334,39 @@ createDebtsMessage user model
 listOfDebtsToText :: User -> Model -> Text
 listOfDebtsToText user model = case HashMap.lookup user (debtorsMap model) of
   Nothing -> "Something went wrong. Probably you are not registered.\n Write /start"
-  Just debtors -> if debtorsText == ""
-                  then "You have no debts"
+  Just debtors -> if HashMap.null debtors
+                  then "You have nor debts, nor loans"
                   else debtorsText
-    where 
+    where
       debtorsText = Text.intercalate "\n"
-        [ userName debtor <> " : " <> Text.pack (show amount)
+        [ pack "Your loans:", myLends, pack "\nYour debts:", myDebts ]
+      myLends = Text.intercalate ""
+        [ if amount > 0
+          then userName debtor <> " - " <> Text.pack (show amount) <> " rub\n"
+          else pack ""
         | (debtor, amount) <- HashMap.toList debtors
-        ] 
+        ]
+      myDebts = Text.intercalate ""
+        [ if amount < 0
+          then userName debtor <> " - " <> Text.pack (show (-amount)) <> " rub\n"
+          else pack ""
+        | (debtor, amount) <- HashMap.toList debtors
+        ]
 
 -- TODO:
--- Регистрация 2 раза (Вагиф)
--- Не давать делать /show_debt без регистрации
--- Удалять из мапы должников если 0 долг
--- Разделиь я должен ..., мне должны ... -- Можно понимать по занку долга
--- В addShares вычитать у того на кого делим <<< done
 --
--- Не отвечать в лс
+-- Backlog ⌛
+-- Не отвечать в лс 
+--
+-- Done
+-- Запрещать нажимать кнопки не адресату
+-- Обработка commandd с @debtevation_bot и без
+-- В addShares вычитать у того на кого делим 
+-- Регистрация 2 раза 
+-- Запрещать все без регистрации
+-- Удалять из мапы должников если 0 долг 
+-- Разделиь я должен ..., мне должны ... -- Можно понимать по занку долга 
+-- Написать хелп 
 
 run :: Token -> IO ()
 run token = do
