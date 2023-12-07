@@ -73,6 +73,7 @@ executable debtevation
                     , telegram-bot-api
                     , text
                     , unordered-containers
+                    , postgresql-simple
                     , hashable
 
     -- Directories containing source files.

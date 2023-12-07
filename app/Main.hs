@@ -21,11 +21,15 @@ import qualified Data.HashMap.Strict as HashMap
 import Data.Maybe (isJust, fromMaybe, mapMaybe, fromJust)
 import Data.Text (Text, breakOn, pack, stripStart, unpack)
 import qualified Data.Text as Text
+import Database.PostgreSQL.Simple
 
 import Telegram.Bot.API
 import Telegram.Bot.Simple
 import Telegram.Bot.Simple.UpdateParser hiding (text)
 import Text.Read
+import Data.List (sort, groupBy, nub)
+import Database.PostgreSQL.Simple.Types (Query(Query))
+import Data.String (IsString(fromString))
 
 -- | Helpers
 
@@ -82,7 +86,7 @@ data ShareInKbQMessage
   deriving (Show, Read)
 
 callbackButton' :: Text -> DebtevationQuery -> InlineKeyboardButton
-callbackButton' label query = callbackButton label (Text.pack (show query))
+callbackButton' label _query = callbackButton label (Text.pack (show _query))
 
 -- | Actions
 
@@ -101,12 +105,88 @@ data Action
   | FinishAccept
   deriving (Show)
 
+getInitialModel :: IO Model
+getInitialModel = do 
+    conn <- connectPostgreSQL "host=localhost dbname=debtevation user=postgres password=postgres"
+    usersDB <- getUsers conn
+    debtorsMapDB <- getDebtorsMap conn usersDB
+    let newModel = Model
+          { debtorsMap = debtorsMapDB,
+            users = usersDB,
+            acceptedDbors = HashSet.empty,
+            shareDebtors = HashSet.empty,
+            sharedAmount = Nothing
+          }  
+    close conn
+    return newModel
+
+    where 
+      getUsers conn = do 
+        rows <- query_ conn "SELECT * FROM \"Users\""
+        return (combineUsers HashMap.empty (rows :: [ (Integer, String, String, String, Bool) ]))
+      
+      combineUsers :: HashMap UserId User -> [ (Integer, String, String, String, Bool) ] -> HashMap UserId User
+      combineUsers _users [] = _users
+      combineUsers _users ((_userId, name, surname, username, isBot):rows) = combineUsers (HashMap.insert (UserId _userId) _user _users) rows
+        where 
+          _user = User {userId = UserId _userId
+          , userIsBot = isBot
+          , userFirstName = pack name
+          , userLastName = Just $ pack surname
+          , userUsername = Just $ pack username
+          , userLanguageCode = Nothing
+          , userIsPremium     = Nothing
+          , userAddedToAttachmentMenu = Nothing  
+          , userCanJoinGroups  = Nothing
+          , userCanReadAllGroupMessages = Nothing 
+          , userSupportsInlineQueries  = Nothing}
+
+
+      getDebtorsMap conn usersDB = do
+        rows <- query_ conn "Select * From \"Debts\" Order By \"Lender\""
+        return $ combineDebtorsMap (rows :: [ (Integer, Integer, Integer) ]) usersDB
+
+      combineDebtorsMap :: [(Integer, Integer, Integer)] -> HashMap UserId User -> HashMap User (HashMap User Int)
+      combineDebtorsMap input userBD = func (convert input userBD)
+        where 
+          func :: [(User, [(User, Int)])] -> HashMap User (HashMap User Int)
+          func = foldl (\acc (u, lst) -> HashMap.insertWith (const id) u (foldl (\m (u', i) -> HashMap.insertWith (+) u' i m) HashMap.empty lst) acc) HashMap.empty
+
+      convert :: [(Integer, Integer, Integer)] -> HashMap UserId User -> [(User, [(User, Int)])]
+      convert xs userBD = map func grooped
+        where 
+          grooped :: [[(Integer, Integer, Integer)]]
+          grooped = groupBy (\(a, _, _) (b, _, _) -> a == b) (sort xs)
+
+          func :: [(Integer, Integer, Integer)] -> (User, [(User, Int)])
+          func input = (uniqueFirst, result)
+            where
+              uniqueFirst = head $ nub $ map (\(x, _, _) -> getUser x) input
+              result = map (\(_, x, y) -> (getUser x, fromInteger y :: Int)) input
+
+              getUser :: Integer -> User 
+              getUser _id = fromJust (HashMap.lookup (UserId _id) userBD)
+
+
+-- updateDebts :: User -> User -> Int -> IO Bool
+-- updateDebts lender borrowed amount = do 
+--     conn <- connectPostgreSQL "host=localhost dbname=debtevation user=postgres password=postgres"
+--     let queryUpdate = fromString ("UPDATE \"Debts\" SET \"Amount\"=" ++ amoutStr ++ " WHERE \"Lender\"="++ lenderId ++" and \"Borrowed\"=" ++ borrowedId ++ "; INSERT INTO table (Lender, Borrowed, Amount) SELECT "++ lenderId ++", "++ borrowedId ++", "++ amoutStr ++" WHERE NOT EXISTS (SELECT 1 FROM table WHERE \"Lender\"="++ lenderId ++" and \"Borrowed\"=" ++ borrowedId ++ ");") :: Query
+--     _ <- query_ conn queryUpdate
+
+--     close conn
+--     return True
+--     where 
+--       lenderId = show (userId lender)
+--       borrowedId = show (userId borrowed)
+--       amoutStr = show amount
+
 -- | Commands and Actions Implementations
 
-debtBot :: BotApp Model Action
-debtBot =
+debtBot :: Model -> BotApp Model Action
+debtBot model =
   BotApp
-    { botInitialModel = initialModel,
+    { botInitialModel = model,
       botAction = updateToAction,
       botHandler = handleAction,
       botJobs = []
@@ -508,7 +588,9 @@ optimizeDebts model = let newModel = model {
 run :: Token -> IO ()
 run token = do
   env <- defaultTelegramClientEnv token
-  startBot_ (conversationBot updateChatId debtBot) env
+  _initialModel <- getInitialModel
+  print(debtorsMap _initialModel)
+  startBot_ (conversationBot updateChatId (debtBot _initialModel)) env
 
 main :: IO ()
 main = do
